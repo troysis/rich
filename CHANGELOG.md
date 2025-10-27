@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added a `final_only` option to `Console.export_svg` / `Console.save_svg` so exports can capture just the last rendered `Live` frame instead of every recorded update https://github.com/Textualize/rich/issues/3813
+
 
 ## [14.1.0] - 2025-06-25
 

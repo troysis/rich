@@ -27,6 +27,7 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
+    Sequence,
     TextIO,
     Tuple,
     Type,
@@ -43,6 +44,7 @@ from ._export_format import CONSOLE_HTML_FORMAT, CONSOLE_SVG_FORMAT
 from ._fileno import get_fileno
 from ._log_render import FormatTimeCallable, LogRender
 from .align import Align, AlignMethod
+from .cells import cell_len, get_character_cell_size
 from .color import ColorSystem, blend_rgb
 from .control import Control
 from .emoji import EmojiVariant
@@ -55,7 +57,7 @@ from .protocol import rich_cast
 from .region import Region
 from .scope import render_scope
 from .screen import Screen
-from .segment import Segment
+from .segment import ControlCode, ControlType, Segment
 from .style import Style, StyleType
 from .styled import Styled
 from .terminal_theme import DEFAULT_TERMINAL_THEME, SVG_EXPORT_THEME, TerminalTheme
@@ -2331,6 +2333,7 @@ class Console:
         code_format: str = CONSOLE_SVG_FORMAT,
         font_aspect_ratio: float = 0.61,
         unique_id: Optional[str] = None,
+        final_only: bool = False,
     ) -> str:
         """
         Generate an SVG from the console contents (requires record=True in Console constructor).
@@ -2347,9 +2350,10 @@ class Console:
                 If you aren't specifying a different font inside ``code_format``, you probably don't need this.
             unique_id (str, optional): unique id that is used as the prefix for various elements (CSS styles, node
                 ids). If not set, this defaults to a computed value based on the recorded content.
+            final_only (bool, optional): If ``True`` Rich will replay recorded control codes to capture only the
+                last rendered frame (useful for ``Live`` output) instead of exporting every recorded update.
+                Defaults to ``False`` for backwards compatibility.
         """
-
-        from rich.cells import cell_len
 
         style_cache: Dict[Style, str] = {}
 
@@ -2438,7 +2442,10 @@ class Console:
             )
 
         with self._record_buffer_lock:
-            segments = list(Segment.filter_control(self._record_buffer))
+            if final_only:
+                segments = _replay_recorded_screen(self._record_buffer)
+            else:
+                segments = list(Segment.filter_control(self._record_buffer))
             if clear:
                 self._record_buffer.clear()
 
@@ -2583,6 +2590,7 @@ class Console:
         code_format: str = CONSOLE_SVG_FORMAT,
         font_aspect_ratio: float = 0.61,
         unique_id: Optional[str] = None,
+        final_only: bool = False,
     ) -> None:
         """Generate an SVG file from the console contents (requires record=True in Console constructor).
 
@@ -2599,6 +2607,8 @@ class Console:
                 If you aren't specifying a different font inside ``code_format``, you probably don't need this.
             unique_id (str, optional): unique id that is used as the prefix for various elements (CSS styles, node
                 ids). If not set, this defaults to a computed value based on the recorded content.
+            final_only (bool, optional): Pass ``True`` to capture only the last rendered frame from the recorded
+                output (discarding intermediate `Live` refreshes). Defaults to ``False``.
         """
         svg = self.export_svg(
             title=title,
@@ -2607,9 +2617,165 @@ class Console:
             code_format=code_format,
             font_aspect_ratio=font_aspect_ratio,
             unique_id=unique_id,
+            final_only=final_only,
         )
         with open(path, "w", encoding="utf-8") as write_file:
             write_file.write(svg)
+
+
+@dataclass
+class _ScreenCell:
+    """Represents a single cell on a virtual terminal screen."""
+
+    char: str = " "
+    style: Optional[Style] = None
+    continuation: bool = False
+
+
+class _RecordedScreen:
+    """Replays recorded segments to recover the final visible frame."""
+
+    def __init__(self) -> None:
+        self.lines: List[List[_ScreenCell]] = []
+        self.cursor_x = 0
+        self.cursor_y = 0
+        self._ensure_line(0)
+
+    def write_text(self, text: str, style: Optional[Style]) -> None:
+        if not text:
+            return
+        for character in text:
+            if character == "\n":
+                self.cursor_x = 0
+                self.cursor_y += 1
+                self._ensure_line(self.cursor_y)
+                continue
+            if character == "\r":
+                self.cursor_x = 0
+                continue
+            width = max(get_character_cell_size(character), 1)
+            line = self._line(self.cursor_y)
+            self._ensure_column(line, self.cursor_x + width - 1)
+            line[self.cursor_x] = _ScreenCell(character, style, False)
+            for offset in range(1, width):
+                line[self.cursor_x + offset] = _ScreenCell("", style, True)
+            self.cursor_x += width
+
+    def apply_control(self, control_codes: Sequence[ControlCode]) -> None:
+        for code in control_codes:
+            control_type = code[0]
+            params = code[1:]
+            if control_type is ControlType.CARRIAGE_RETURN:
+                self.cursor_x = 0
+            elif control_type is ControlType.HOME:
+                self.cursor_x = 0
+                self.cursor_y = 0
+            elif control_type is ControlType.CLEAR:
+                self.lines = [[]]
+                self.cursor_x = 0
+                self.cursor_y = 0
+            elif control_type is ControlType.CURSOR_UP:
+                amount = int(params[0]) if params else 1
+                self.cursor_y = max(0, self.cursor_y - amount)
+            elif control_type is ControlType.CURSOR_DOWN:
+                amount = int(params[0]) if params else 1
+                self.cursor_y += amount
+                self._ensure_line(self.cursor_y)
+            elif control_type is ControlType.CURSOR_FORWARD:
+                amount = int(params[0]) if params else 1
+                self.cursor_x += amount
+            elif control_type is ControlType.CURSOR_BACKWARD:
+                amount = int(params[0]) if params else 1
+                self.cursor_x = max(0, self.cursor_x - amount)
+            elif control_type is ControlType.CURSOR_MOVE_TO_COLUMN:
+                column = int(params[0]) if params else 0
+                self.cursor_x = max(0, column)
+                self._ensure_line(self.cursor_y)
+            elif control_type is ControlType.CURSOR_MOVE_TO:
+                x = int(params[0]) if params else 0
+                y = int(params[1]) if len(params) > 1 else 0
+                self.cursor_x = max(0, x)
+                self.cursor_y = max(0, y)
+                self._ensure_line(self.cursor_y)
+            elif control_type is ControlType.ERASE_IN_LINE:
+                mode = int(params[0]) if params else 0
+                self._erase_in_line(mode)
+            elif control_type in (
+                ControlType.ENABLE_ALT_SCREEN,
+                ControlType.DISABLE_ALT_SCREEN,
+            ):
+                self.lines = [[]]
+                self.cursor_x = 0
+                self.cursor_y = 0
+            else:
+                # Cursor visibility, bells, and title changes do not alter the onscreen buffer.
+                continue
+
+    def to_segments(self) -> List[Segment]:
+        segments: List[Segment] = []
+        newline = Segment.line()
+        for index, line in enumerate(self.lines):
+            segments.extend(self._line_to_segments(line))
+            if index < len(self.lines) - 1:
+                segments.append(newline)
+        return segments
+
+    def _line(self, line_no: int) -> List[_ScreenCell]:
+        self._ensure_line(line_no)
+        return self.lines[line_no]
+
+    def _ensure_line(self, line_no: int) -> None:
+        while len(self.lines) <= line_no:
+            self.lines.append([])
+
+    @staticmethod
+    def _ensure_column(line: List[_ScreenCell], column: int) -> None:
+        while len(line) <= column:
+            line.append(_ScreenCell())
+
+    def _erase_in_line(self, mode: int) -> None:
+        line = self._line(self.cursor_y)
+        if not line:
+            return
+        if mode == 2:
+            line.clear()
+            return
+        start = self.cursor_x if mode == 0 else 0
+        end = len(line) if mode == 0 else min(self.cursor_x + 1, len(line))
+        if start >= len(line):
+            return
+        for index in range(start, end):
+            line[index] = _ScreenCell()
+
+    @staticmethod
+    def _line_to_segments(line: List[_ScreenCell]) -> List[Segment]:
+        if not line:
+            return []
+        segments: List[Segment] = []
+        buffer: List[str] = []
+        buffer_style: Optional[Style] = None
+        for cell in line:
+            if cell.continuation:
+                continue
+            if buffer and cell.style != buffer_style:
+                segments.append(Segment("".join(buffer), buffer_style))
+                buffer = []
+            buffer_style = cell.style
+            buffer.append(cell.char)
+        if buffer:
+            segments.append(Segment("".join(buffer), buffer_style))
+        return segments
+
+
+def _replay_recorded_screen(segments: Iterable[Segment]) -> List[Segment]:
+    """Apply recorded control codes to recover the last rendered frame."""
+    screen = _RecordedScreen()
+    for segment in segments:
+        if segment.control:
+            screen.apply_control(segment.control)
+        elif segment.text:
+            screen.write_text(segment.text, segment.style)
+    return screen.to_segments()
 
 
 def _svg_hash(svg_main_code: str) -> str:
